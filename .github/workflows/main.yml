@@ -1,56 +1,193 @@
+# name: Deploy UrbanGrow CloudFormation Stack
+
+# on:
+#   workflow_dispatch:
+
+# jobs:
+#   deploy:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Checkout Repo
+#         uses: actions/checkout@v4
+
+#       - name: Configure AWS Credentials
+#         uses: aws-actions/configure-aws-credentials@v4
+#         with:
+#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+#           aws-region: us-east-1
+
+#       - name: Deploy Main UrbanGrow Stack
+#         run: |
+#           aws cloudformation deploy \
+#             --stack-name ${{ secrets.GROUP_NAME }}-urbangrow-stack \
+#             --template-file cfstack.yml \
+#             --capabilities CAPABILITY_IAM \
+#             --parameter-overrides \
+#               GroupName=${{ secrets.GROUP_NAME }} \
+#               GroupSize=${{ secrets.GROUP_SIZE }} \
+#               KeyName=${{ secrets.KEY_NAME }}
+
+#       - name: Install MongoDB Shell
+#         run: |
+#           wget -qO- https://www.mongodb.org/static/pgp/server-7.0.asc | sudo tee /etc/apt/trusted.gpg.d/server-7.0.asc
+#           echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
+#           sudo apt-get update
+#           sudo apt-get install -y mongodb-mongosh
+
+#       - name: Get MongoDB Server Public IP
+#         id: getDBIp
+#         run: |
+#           DB_IP=$(aws cloudformation describe-stacks \
+#             --stack-name ${{ secrets.GROUP_NAME }}-urbangrow-stack \
+#             --query "Stacks[0].Outputs[?OutputKey=='MongoServerPublicIP'].OutputValue" \
+#             --output text)
+#           echo "DB_SERVER_IP=$DB_IP" >> $GITHUB_ENV
+          
+#       - name: Load Data into MongoDB
+#         run: |
+#           echo "Attempting to connect to the database at $DB_SERVER_IP and load data..."
+#           # Note: The UserData script on the EC2 instance can take a minute to run.
+#           # We add a sleep here to give it time to install and start MongoDB before we try to connect.
+#           sleep 60 
+#           mongosh "mongodb://${{ env.DB_SERVER_IP }}:27017" < DBLoad.js
+
+
 name: Deploy UrbanGrow CloudFormation Stack
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      # 0) Checkout
       - name: Checkout Repo
         uses: actions/checkout@v4
 
+      # 1) Configure AWS credentials (use SESSION_TOKEN only if you actually have temporary creds)
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: us-east-1
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }} # remove this line if you use permanent keys
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy Main UrbanGrow Stack
+      # 2) Validate required inputs exist and build a STACK_NAME
+      - name: Validate inputs
+        env:
+          GROUP_NAME: ${{ secrets.GROUP_NAME }}
+          GROUP_SIZE: ${{ secrets.GROUP_SIZE }}
+          KEY_NAME:   ${{ secrets.KEY_NAME }}
         run: |
+          [ -n "$GROUP_NAME" ] || { echo "❌ Missing secret GROUP_NAME"; exit 1; }
+          [ -n "$GROUP_SIZE" ] || { echo "❌ Missing secret GROUP_SIZE (must be 2 or 3)"; exit 1; }
+          [ -n "$KEY_NAME" ]   || { echo "❌ Missing secret KEY_NAME (existing EC2 key pair in us-east-1)"; exit 1; }
+          echo "Using GROUP_NAME=$GROUP_NAME, GROUP_SIZE=$GROUP_SIZE, KEY_NAME=$KEY_NAME"
+          echo "STACK_NAME=${GROUP_NAME}-urbangrow-stack" >> $GITHUB_ENV
+
+      # 3) Validate the CloudFormation template syntax before deploying
+      - name: Validate template
+        run: aws cloudformation validate-template --template-body file://cfstack.yml
+
+      # 4) Deploy the stack
+      - name: Deploy Main UrbanGrow Stack
+        env:
+          GROUP_NAME: ${{ secrets.GROUP_NAME }}
+          GROUP_SIZE: ${{ secrets.GROUP_SIZE }}
+          KEY_NAME:   ${{ secrets.KEY_NAME }}
+        run: |
+          set -euxo pipefail
           aws cloudformation deploy \
-            --stack-name ${{ secrets.GROUP_NAME }}-urbangrow-stack \
+            --stack-name "${STACK_NAME}" \
             --template-file cfstack.yml \
             --capabilities CAPABILITY_IAM \
             --parameter-overrides \
-              GroupName=${{ secrets.GROUP_NAME }} \
-              GroupSize=${{ secrets.GROUP_SIZE }} \
-              KeyName=${{ secrets.KEY_NAME }}
+              GroupName="${GROUP_NAME}" \
+              GroupSize=${GROUP_SIZE} \
+              KeyName="${KEY_NAME}"
 
-      - name: Install MongoDB Shell
+      # 5) If deploy fails, print detailed failure events
+      - name: Show stack events on failure
+        if: failure()
         run: |
-          wget -qO- https://www.mongodb.org/static/pgp/server-7.0.asc | sudo tee /etc/apt/trusted.gpg.d/server-7.0.asc
+          aws cloudformation describe-stack-events \
+            --stack-name "${STACK_NAME}" \
+            --query "StackEvents[?contains(ResourceStatus,'FAILED')||contains(ResourceStatus,'ROLLBACK')][].{Time:Timestamp,Id:LogicalResourceId,Type:ResourceType,Status:ResourceStatus,Reason:ResourceStatusReason}" \
+            --output table || true
+          echo "---- Stack status ----"
+          aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].[StackStatus,StackStatusReason]" \
+            --output table || true
+
+      # 6) Read stack outputs (Web + Mongo public IPs)
+      - name: Read stack outputs
+        id: outs
+        run: |
+          set -e
+          WEB_IP=$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='WebServerPublicIP'].OutputValue" --output text)
+          DB_IP=$(aws cloudformation describe-stacks --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='MongoServerPublicIP'].OutputValue" --output text)
+
+          [ -n "$WEB_IP" ] || { echo "❌ WebServerPublicIP output is empty"; exit 1; }
+          [ -n "$DB_IP" ]  || { echo "❌ MongoServerPublicIP output is empty"; exit 1; }
+
+          echo "WEB_SERVER_IP=$WEB_IP" >> $GITHUB_ENV
+          echo "DB_SERVER_IP=$DB_IP" >> $GITHUB_ENV
+          echo "WebServerPublicIP=$WEB_IP"
+          echo "MongoServerPublicIP=$DB_IP"
+
+      # 7) Install MongoDB Shell (mongosh) on the runner
+      - name: Install MongoDB Shell (mongosh)
+        run: |
+          wget -qO- https://www.mongodb.org/static/pgp/server-7.0.asc | sudo tee /etc/apt/trusted.gpg.d/server-7.0.asc >/dev/null
           echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y mongodb-mongosh
 
-      - name: Get MongoDB Server Public IP
-        id: getDBIp
+      # 8) Seed MongoDB with the dataset (tries DBLoad.js, falls back to DSLoad.js)
+      - name: Seed MongoDB
+        env:
+          DB_SERVER_IP: ${{ env.DB_SERVER_IP }}
         run: |
-          DB_IP=$(aws cloudformation describe-stacks \
-            --stack-name ${{ secrets.GROUP_NAME }}-urbangrow-stack \
-            --query "Stacks[0].Outputs[?OutputKey=='MongoServerPublicIP'].OutputValue" \
-            --output text)
-          echo "DB_SERVER_IP=$DB_IP" >> $GITHUB_ENV
-          
-      - name: Load Data into MongoDB
+          set -euxo pipefail
+
+          # Choose the correct seed file
+          if [ -f "DBLoad.js" ]; then SEED_FILE="DBLoad.js";
+          elif [ -f "DSLoad.js" ]; then SEED_FILE="DSLoad.js";
+          else echo "❌ Seed file not found (expected DBLoad.js or DSLoad.js at repo root)"; ls -la; exit 1; fi
+          echo "Using seed file: $SEED_FILE"
+
+          # Wait for Mongo to be ready (up to ~3 minutes)
+          for i in {1..18}; do
+            if mongosh --quiet "mongodb://${DB_SERVER_IP}:27017" --eval 'db.runCommand({ ping: 1 })' >/dev/null 2>&1; then
+              echo "✅ Mongo is accepting connections"
+              break
+            fi
+            echo "Mongo not ready yet; retry $i/18..."
+            sleep 10
+          done
+
+          # Load the data
+          echo "Seeding database at ${DB_SERVER_IP}:27017 ..."
+          mongosh "mongodb://${DB_SERVER_IP}:27017" < "$SEED_FILE"
+
+      # 9) Show the URLs you can open
+      - name: Show application URLs
         run: |
-          echo "Attempting to connect to the database at $DB_SERVER_IP and load data..."
-          # Note: The UserData script on the EC2 instance can take a minute to run.
-          # We add a sleep here to give it time to install and start MongoDB before we try to connect.
-          sleep 60 
-          mongosh "mongodb://${{ env.DB_SERVER_IP }}:27017" < DBLoad.js
-
-
+          echo ""
+          echo "========================================"
+          echo " Web dashboard:  http://${WEB_SERVER_IP}/"
+          echo " Mongo server:   ${DB_SERVER_IP}:27017"
+          echo "========================================"
