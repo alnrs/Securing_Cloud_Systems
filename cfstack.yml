@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   UrbanGrow Group Project.
   Insecure demo environment with Web, MongoDB, Windows VDI,
-  using EXISTING AWS Managed Microsoft AD.
+  using NEW AWS Managed Microsoft AD.
 
 Parameters:
   GroupName:
@@ -26,19 +26,6 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Password for AD Administrator
-
-  ExistingDirectoryId:
-    Type: String
-    Default: d-906619acf0
-    Description: Existing AWS Managed Microsoft AD ID
-
-  ADDnsIp1:
-    Type: String
-    Description: Primary DNS IP of existing AD
-
-  ADDnsIp2:
-    Type: String
-    Description: Secondary DNS IP of existing AD
 
   WindowsAmi:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
@@ -184,6 +171,22 @@ Resources:
           systemctl start httpd
 
   # ------------------------------------------------------------
+  # Create new Microsoft AD
+  # ------------------------------------------------------------
+  NewDirectory:
+    Type: AWS::DirectoryService::MicrosoftAD
+    Properties:
+      Name: !Ref DomainName
+      Password: !Ref DirectoryAdminPassword
+      VpcSettings:
+        VpcId: !Ref VPC
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Edition: Standard
+      ShortName: UrbanGrow
+
+  # ------------------------------------------------------------
   # IAM for VDI Domain Join
   # ------------------------------------------------------------
   VDIJoinRole:
@@ -233,22 +236,26 @@ Resources:
       SecurityGroupIds: [!Ref VDISG]
       IamInstanceProfile: !Ref VDIInstanceProfile
       UserData:
-        Fn::Base64: !Sub |
-          <powershell>
-          $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"}
-          Set-DnsClientServerAddress `
-            -InterfaceIndex $adapter.InterfaceIndex `
-            -ServerAddresses ("${ADDnsIp1}", "${ADDnsIp2}")
+        Fn::Base64:
+          !Sub
+            - |
+              <powershell>
+              $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"}
+              Set-DnsClientServerAddress `
+                -InterfaceIndex $adapter.InterfaceIndex `
+                -ServerAddresses ("${DnsIp1}", "${DnsIp2}")
 
-          $pw = ConvertTo-SecureString "${DirectoryAdminPassword}" -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential ("Administrator", $pw)
+              $pw = ConvertTo-SecureString "${DirectoryAdminPassword}" -AsPlainText -Force
+              $cred = New-Object System.Management.Automation.PSCredential ("Administrator", $pw)
 
-          Add-Computer `
-            -DomainName "${DomainName}" `
-            -Credential $cred `
-            -Restart `
-            -Force
-          </powershell>
+              Add-Computer `
+                -DomainName "${DomainName}" `
+                -Credential $cred `
+                -Restart `
+                -Force
+              </powershell>
+            - DnsIp1: !Select [0, !GetAtt NewDirectory.DnsIpAddresses]
+              DnsIp2: !Select [1, !GetAtt NewDirectory.DnsIpAddresses]
 
 Outputs:
   WebServerPublicIP:
@@ -257,9 +264,17 @@ Outputs:
   MongoServerPublicIP:
     Value: !GetAtt MongoInstance.PublicIp
 
-  UsedDirectoryId:
-    Description: Existing AD in use
-    Value: !Ref ExistingDirectoryId
+  NewDirectoryId:
+    Description: New AWS Managed Microsoft AD Directory ID
+    Value: !Ref NewDirectory
+
+  DirectoryDnsIp1:
+    Description: Primary DNS IP of new AD
+    Value: !Select [0, !GetAtt NewDirectory.DnsIpAddresses]
+
+  DirectoryDnsIp2:
+    Description: Secondary DNS IP of new AD
+    Value: !Select [1, !GetAtt NewDirectory.DnsIpAddresses]
 
   VDIInstanceId:
     Condition: CreateVDI
