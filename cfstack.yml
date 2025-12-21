@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: UrbanGrow Full Stack with VPC, Microsoft AD, and Windows VDI (AWS Academy Safe)
+Description: UrbanGrow VPC + Windows VDI using EXISTING Microsoft AD (AWS Academy Safe)
 
 Parameters:
   GroupName:
@@ -15,6 +15,19 @@ Parameters:
     NoEcho: true
     MinLength: 8
     Description: Password for AD Administrator
+
+  ExistingDirectoryId:
+    Type: String
+    Default: d-906619acf0
+    Description: Existing AWS Managed Microsoft AD ID
+
+  ADDnsIp1:
+    Type: String
+    Description: First DNS IP of existing AD
+
+  ADDnsIp2:
+    Type: String
+    Description: Second DNS IP of existing AD
 
 Resources:
 
@@ -48,20 +61,6 @@ Resources:
       MapPublicIpOnLaunch: true
       AvailabilityZone: !Select [0, !GetAZs '']
 
-  PrivateSubnet1:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.10.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-
-  PrivateSubnet2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.11.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
-
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -82,22 +81,7 @@ Resources:
       RouteTableId: !Ref PublicRouteTable
 
   # ----------------------------
-  # DIRECTORY SERVICE (AD)
-  # ----------------------------
-  DirectoryService:
-    Type: AWS::DirectoryService::MicrosoftAD
-    Properties:
-      Name: urbangrow.local
-      Password: !Ref DirectoryAdminPassword
-      Edition: Standard
-      VpcSettings:
-        VpcId: !Ref VPC
-        SubnetIds:
-          - !Ref PrivateSubnet1
-          - !Ref PrivateSubnet2
-
-  # ----------------------------
-  # SECURITY GROUPS
+  # SECURITY GROUP
   # ----------------------------
   VDISecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -115,26 +99,31 @@ Resources:
   # ----------------------------
   VDIInstance:
     Type: AWS::EC2::Instance
-    DependsOn: DirectoryService
     Properties:
       InstanceType: t3.medium
-      ImageId: ami-06777e7ef7441deff   # Windows Server 2025 Base
+      ImageId: ami-06777e7ef7441deff   # Windows Server
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet
       SecurityGroupIds:
         - !Ref VDISecurityGroup
-
-      # ⚠️ Use EXISTING instance profile (AWS Academy)
       IamInstanceProfile: LabInstanceProfile
 
       UserData:
         Fn::Base64: !Sub |
           <powershell>
-          $domain = "urbangrow.local"
+          # Set DNS to existing AD
+          $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"}
+          Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex `
+            -ServerAddresses ("${ADDnsIp1}", "${ADDnsIp2}")
+
           $password = "${DirectoryAdminPassword}" | ConvertTo-SecureString -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential ("Administrator", $password)
 
-          Add-Computer -DomainName $domain -Credential $cred -Force -Restart
+          Add-Computer `
+            -DomainName "urbangrow.local" `
+            -Credential $cred `
+            -Force `
+            -Restart
           </powershell>
 
       Tags:
@@ -146,6 +135,6 @@ Outputs:
     Description: Windows VDI Public IP
     Value: !GetAtt VDIInstance.PublicIp
 
-  DirectoryDNS:
-    Description: Active Directory DNS IPs
-    Value: !Join [", ", !GetAtt DirectoryService.DnsIpAddresses]
+  UsedDirectoryId:
+    Description: Existing AD Directory ID
+    Value: !Ref ExistingDirectoryId
