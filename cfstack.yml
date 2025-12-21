@@ -1,48 +1,26 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  UrbanGrow Group Project.
-  Insecure demo environment with Web, MongoDB, Windows VDI,
-  using NEW AWS Managed Microsoft AD.
-  Uses existing IAM Instance Profile for VDI domain join.
+Description: UrbanGrow Full Stack with VPC, Microsoft AD, and Windows VDI (AWS Academy Safe)
 
 Parameters:
   GroupName:
     Type: String
-    Description: Group name or number (e.g., Group-01)
-
-  GroupSize:
-    Type: Number
-    Default: 2
-    AllowedValues: [2, 3]
+    Default: Group01
 
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
-    Description: Existing EC2 key pair
-
-  DomainName:
-    Type: String
-    Default: corp.urbangrow.local
+    Description: Existing EC2 KeyPair
 
   DirectoryAdminPassword:
     Type: String
     NoEcho: true
+    MinLength: 8
     Description: Password for AD Administrator
 
-  WindowsAmi:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
-
-  ExistingVDIInstanceProfile:
-    Type: String
-    Description: Existing IAM Instance Profile name for VDI domain join EC2
-
-Conditions:
-  CreateVDI: !Equals [!Ref GroupSize, 3]
-
 Resources:
-  # ------------------------------------------------------------
-  # VPC + Networking
-  # ------------------------------------------------------------
+
+  # ----------------------------
+  # VPC & SUBNETS
+  # ----------------------------
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -62,20 +40,13 @@ Resources:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
 
-  PublicSubnet1:
+  PublicSubnet:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.0.1.0/24
       MapPublicIpOnLaunch: true
       AvailabilityZone: !Select [0, !GetAZs '']
-
-  PublicSubnet2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.2.0/24
-      MapPublicIpOnLaunch: true
 
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
@@ -89,6 +60,7 @@ Resources:
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
@@ -103,102 +75,34 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
 
-  PublicSubnet1RT:
+  PublicSubnetRouteAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnet1
+      SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
 
-  PublicSubnet2RT:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet2
-      RouteTableId: !Ref PublicRouteTable
-
-  # ------------------------------------------------------------
-  # MongoDB EC2
-  # ------------------------------------------------------------
-  MongoSG:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Insecure MongoDB
-      VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 27017
-          ToPort: 27017
-          CidrIp: 0.0.0.0/0
-
-  MongoInstance:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: t3.small
-      ImageId: ami-00ca32bbc84273381
-      SubnetId: !Ref PublicSubnet1
-      KeyName: !Ref KeyName
-      SecurityGroupIds: [!Ref MongoSG]
-      UserData:
-        Fn::Base64: |
-          #!/bin/bash
-          dnf install -y mongodb-org
-          systemctl enable mongod
-          systemctl start mongod
-          sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf
-          systemctl restart mongod
-
-  # ------------------------------------------------------------
-  # Web Server
-  # ------------------------------------------------------------
-  WebSG:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Insecure HTTP
-      VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-
-  WebInstance:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: t2.micro
-      ImageId: ami-00ca32bbc84273381
-      SubnetId: !Ref PublicSubnet1
-      KeyName: !Ref KeyName
-      SecurityGroupIds: [!Ref WebSG]
-      UserData:
-        Fn::Base64: |
-          #!/bin/bash
-          dnf install -y httpd
-          systemctl enable httpd
-          systemctl start httpd
-
-  # ------------------------------------------------------------
-  # Create new Microsoft AD
-  # ------------------------------------------------------------
-  NewDirectory:
+  # ----------------------------
+  # DIRECTORY SERVICE (AD)
+  # ----------------------------
+  DirectoryService:
     Type: AWS::DirectoryService::MicrosoftAD
     Properties:
-      Name: !Ref DomainName
+      Name: urbangrow.local
       Password: !Ref DirectoryAdminPassword
+      Edition: Standard
       VpcSettings:
         VpcId: !Ref VPC
         SubnetIds:
           - !Ref PrivateSubnet1
           - !Ref PrivateSubnet2
-      Edition: Standard
-      ShortName: UrbanGrow
 
-  # ------------------------------------------------------------
-  # Windows VDI (Domain Joined)
-  # ------------------------------------------------------------
-  VDISG:
+  # ----------------------------
+  # SECURITY GROUPS
+  # ----------------------------
+  VDISecurityGroup:
     Type: AWS::EC2::SecurityGroup
-    Condition: CreateVDI
     Properties:
-      GroupDescription: Insecure RDP
+      GroupDescription: Allow RDP
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -206,60 +110,42 @@ Resources:
           ToPort: 3389
           CidrIp: 0.0.0.0/0
 
+  # ----------------------------
+  # WINDOWS VDI INSTANCE
+  # ----------------------------
   VDIInstance:
     Type: AWS::EC2::Instance
-    Condition: CreateVDI
+    DependsOn: DirectoryService
     Properties:
       InstanceType: t3.medium
-      ImageId: !Ref WindowsAmi
-      SubnetId: !Ref PublicSubnet1
+      ImageId: ami-06777e7ef7441deff   # Windows Server 2025 Base
       KeyName: !Ref KeyName
-      SecurityGroupIds: [!Ref VDISG]
-      IamInstanceProfile: !Ref ExistingVDIInstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref VDISecurityGroup
+
+      # ⚠️ Use EXISTING instance profile (AWS Academy)
+      IamInstanceProfile: LabInstanceProfile
+
       UserData:
-        Fn::Base64:
-          !Sub
-            - |
-              <powershell>
-              $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"}
-              Set-DnsClientServerAddress `
-                -InterfaceIndex $adapter.InterfaceIndex `
-                -ServerAddresses ("${DnsIp1}", "${DnsIp2}")
+        Fn::Base64: !Sub |
+          <powershell>
+          $domain = "urbangrow.local"
+          $password = "${DirectoryAdminPassword}" | ConvertTo-SecureString -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential ("Administrator", $password)
 
-              $pw = ConvertTo-SecureString "${DirectoryAdminPassword}" -AsPlainText -Force
-              $cred = New-Object System.Management.Automation.PSCredential ("Administrator", $pw)
+          Add-Computer -DomainName $domain -Credential $cred -Force -Restart
+          </powershell>
 
-              Add-Computer `
-                -DomainName "${DomainName}" `
-                -Credential $cred `
-                -Restart `
-                -Force
-              </powershell>
-            - DnsIp1: !Select [0, !GetAtt NewDirectory.DnsIpAddresses]
-              DnsIp2: !Select [1, !GetAtt NewDirectory.DnsIpAddresses]
+      Tags:
+        - Key: Name
+          Value: !Sub urbangrow-vdi-${GroupName}
 
 Outputs:
-  WebServerPublicIP:
-    Description: Public IP of the Web Server
-    Value: !GetAtt WebInstance.PublicIp
+  VDIInstancePublicIP:
+    Description: Windows VDI Public IP
+    Value: !GetAtt VDIInstance.PublicIp
 
-  MongoServerPublicIP:
-    Description: Public IP of the MongoDB Server
-    Value: !GetAtt MongoInstance.PublicIp
-
-  NewDirectoryId:
-    Description: New AWS Managed Microsoft AD Directory ID
-    Value: !Ref NewDirectory
-
-  DirectoryDnsIp1:
-    Description: Primary DNS IP of new AD
-    Value: !Select [0, !GetAtt NewDirectory.DnsIpAddresses]
-
-  DirectoryDnsIp2:
-    Description: Secondary DNS IP of new AD
-    Value: !Select [1, !GetAtt NewDirectory.DnsIpAddresses]
-
-  VDIInstanceId:
-    Description: Instance ID of the Windows VDI (if created)
-    Condition: CreateVDI
-    Value: !Ref VDIInstance
+  DirectoryDNS:
+    Description: Active Directory DNS IPs
+    Value: !Join [", ", !GetAtt DirectoryService.DnsIpAddresses]
