@@ -410,7 +410,7 @@ Resources:
     Condition: CreateVDI
     Properties:
       InstanceType: t3.medium
-      ImageId: ami-0efee5160a1079475 # Windows Server 2025 Base
+      ImageId: ami-06777e7ef7441deff # Windows Server 2025 Base
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1 # Insecurely placed in a public subnet for easy access
       SecurityGroupIds:
