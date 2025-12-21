@@ -1,19 +1,30 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: UrbanGrow VPC + Windows VDI using EXISTING Microsoft AD (AWS Academy Safe)
+Description: >
+  UrbanGrow Group Project.
+  Insecure demo environment with Web, MongoDB, Windows VDI,
+  using EXISTING AWS Managed Microsoft AD.
 
 Parameters:
   GroupName:
     Type: String
-    Default: Group01
+    Description: Group name or number (e.g., Group-01)
+
+  GroupSize:
+    Type: Number
+    Default: 2
+    AllowedValues: [2, 3]
 
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
-    Description: Existing EC2 KeyPair
+    Description: Existing EC2 key pair
+
+  DomainName:
+    Type: String
+    Default: corp.urbangrow.local
 
   DirectoryAdminPassword:
     Type: String
     NoEcho: true
-    MinLength: 8
     Description: Password for AD Administrator
 
   ExistingDirectoryId:
@@ -23,17 +34,23 @@ Parameters:
 
   ADDnsIp1:
     Type: String
-    Description: First DNS IP of existing AD
+    Description: Primary DNS IP of existing AD
 
   ADDnsIp2:
     Type: String
-    Description: Second DNS IP of existing AD
+    Description: Secondary DNS IP of existing AD
+
+  WindowsAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+
+Conditions:
+  CreateVDI: !Equals [!Ref GroupSize, 3]
 
 Resources:
-
-  # ----------------------------
-  # VPC & SUBNETS
-  # ----------------------------
+  # ------------------------------------------------------------
+  # VPC + Networking
+  # ------------------------------------------------------------
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -53,13 +70,33 @@ Resources:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
 
-  PublicSubnet:
+  PublicSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.0.1.0/24
       MapPublicIpOnLaunch: true
       AvailabilityZone: !Select [0, !GetAZs '']
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
@@ -74,19 +111,110 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
 
-  PublicSubnetRouteAssoc:
+  PublicSubnet1RT:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnet
+      SubnetId: !Ref PublicSubnet1
       RouteTableId: !Ref PublicRouteTable
 
-  # ----------------------------
-  # SECURITY GROUP
-  # ----------------------------
-  VDISecurityGroup:
+  PublicSubnet2RT:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ------------------------------------------------------------
+  # MongoDB EC2
+  # ------------------------------------------------------------
+  MongoSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow RDP
+      GroupDescription: Insecure MongoDB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          CidrIp: 0.0.0.0/0
+
+  MongoInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: ami-00ca32bbc84273381
+      SubnetId: !Ref PublicSubnet1
+      KeyName: !Ref KeyName
+      SecurityGroupIds: [!Ref MongoSG]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y mongodb-org
+          systemctl enable mongod
+          systemctl start mongod
+          sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf
+          systemctl restart mongod
+
+  # ------------------------------------------------------------
+  # Web Server
+  # ------------------------------------------------------------
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Insecure HTTP
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  WebInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-00ca32bbc84273381
+      SubnetId: !Ref PublicSubnet1
+      KeyName: !Ref KeyName
+      SecurityGroupIds: [!Ref WebSG]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y httpd
+          systemctl enable httpd
+          systemctl start httpd
+
+  # ------------------------------------------------------------
+  # IAM for VDI Domain Join
+  # ------------------------------------------------------------
+  VDIJoinRole:
+    Type: AWS::IAM::Role
+    Condition: CreateVDI
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess
+
+  VDIInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: CreateVDI
+    Properties:
+      Roles: [!Ref VDIJoinRole]
+
+  # ------------------------------------------------------------
+  # Windows VDI (Domain Joined)
+  # ------------------------------------------------------------
+  VDISG:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVDI
+    Properties:
+      GroupDescription: Insecure RDP
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -94,47 +222,45 @@ Resources:
           ToPort: 3389
           CidrIp: 0.0.0.0/0
 
-  # ----------------------------
-  # WINDOWS VDI INSTANCE
-  # ----------------------------
   VDIInstance:
     Type: AWS::EC2::Instance
+    Condition: CreateVDI
     Properties:
       InstanceType: t3.medium
-      ImageId: ami-06777e7ef7441deff   # Windows Server
+      ImageId: !Ref WindowsAmi
+      SubnetId: !Ref PublicSubnet1
       KeyName: !Ref KeyName
-      SubnetId: !Ref PublicSubnet
-      SecurityGroupIds:
-        - !Ref VDISecurityGroup
-      IamInstanceProfile: LabInstanceProfile
-
+      SecurityGroupIds: [!Ref VDISG]
+      IamInstanceProfile: !Ref VDIInstanceProfile
       UserData:
         Fn::Base64: !Sub |
           <powershell>
-          # Set DNS to existing AD
           $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"}
-          Set-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex `
+          Set-DnsClientServerAddress `
+            -InterfaceIndex $adapter.InterfaceIndex `
             -ServerAddresses ("${ADDnsIp1}", "${ADDnsIp2}")
 
-          $password = "${DirectoryAdminPassword}" | ConvertTo-SecureString -AsPlainText -Force
-          $cred = New-Object System.Management.Automation.PSCredential ("Administrator", $password)
+          $pw = ConvertTo-SecureString "${DirectoryAdminPassword}" -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential ("Administrator", $pw)
 
           Add-Computer `
-            -DomainName "urbangrow.local" `
+            -DomainName "${DomainName}" `
             -Credential $cred `
-            -Force `
-            -Restart
+            -Restart `
+            -Force
           </powershell>
 
-      Tags:
-        - Key: Name
-          Value: !Sub urbangrow-vdi-${GroupName}
-
 Outputs:
-  VDIInstancePublicIP:
-    Description: Windows VDI Public IP
-    Value: !GetAtt VDIInstance.PublicIp
+  WebServerPublicIP:
+    Value: !GetAtt WebInstance.PublicIp
+
+  MongoServerPublicIP:
+    Value: !GetAtt MongoInstance.PublicIp
 
   UsedDirectoryId:
-    Description: Existing AD Directory ID
+    Description: Existing AD in use
     Value: !Ref ExistingDirectoryId
+
+  VDIInstanceId:
+    Condition: CreateVDI
+    Value: !Ref VDIInstance
