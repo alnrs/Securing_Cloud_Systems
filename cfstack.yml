@@ -3,6 +3,7 @@ Description: >
   UrbanGrow Group Project.
   Insecure demo environment with Web, MongoDB, Windows VDI,
   using NEW AWS Managed Microsoft AD.
+  Uses existing IAM Instance Profile for VDI domain join.
 
 Parameters:
   GroupName:
@@ -30,6 +31,10 @@ Parameters:
   WindowsAmi:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+
+  ExistingVDIInstanceProfile:
+    Type: String
+    Description: Existing IAM Instance Profile name for VDI domain join EC2
 
 Conditions:
   CreateVDI: !Equals [!Ref GroupSize, 3]
@@ -187,30 +192,6 @@ Resources:
       ShortName: UrbanGrow
 
   # ------------------------------------------------------------
-  # IAM for VDI Domain Join
-  # ------------------------------------------------------------
-  VDIJoinRole:
-    Type: AWS::IAM::Role
-    Condition: CreateVDI
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ec2.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-        - arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess
-
-  VDIInstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Condition: CreateVDI
-    Properties:
-      Roles: [!Ref VDIJoinRole]
-
-  # ------------------------------------------------------------
   # Windows VDI (Domain Joined)
   # ------------------------------------------------------------
   VDISG:
@@ -234,7 +215,7 @@ Resources:
       SubnetId: !Ref PublicSubnet1
       KeyName: !Ref KeyName
       SecurityGroupIds: [!Ref VDISG]
-      IamInstanceProfile: !Ref VDIInstanceProfile
+      IamInstanceProfile: !Ref ExistingVDIInstanceProfile
       UserData:
         Fn::Base64:
           !Sub
@@ -259,9 +240,11 @@ Resources:
 
 Outputs:
   WebServerPublicIP:
+    Description: Public IP of the Web Server
     Value: !GetAtt WebInstance.PublicIp
 
   MongoServerPublicIP:
+    Description: Public IP of the MongoDB Server
     Value: !GetAtt MongoInstance.PublicIp
 
   NewDirectoryId:
@@ -277,5 +260,6 @@ Outputs:
     Value: !Select [1, !GetAtt NewDirectory.DnsIpAddresses]
 
   VDIInstanceId:
+    Description: Instance ID of the Windows VDI (if created)
     Condition: CreateVDI
     Value: !Ref VDIInstance
