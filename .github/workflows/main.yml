@@ -39,7 +39,9 @@ jobs:
             --parameter-overrides \
               GroupName=${{ secrets.GROUP_NAME }} \
               GroupSize=${{ secrets.GROUP_SIZE }} \
-              KeyName=${{ secrets.KEY_NAME }}
+              KeyName=${{ secrets.KEY_NAME }} \
+              DirectoryAdminPassword='Str0ng!Pass123'
+
 
       # 3️⃣ Print stack events if deployment fails (CRITICAL)
       - name: Show CloudFormation failure reason
