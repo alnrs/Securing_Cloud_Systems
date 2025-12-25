@@ -1,5 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: UrbanGrow Insecure Lab with MongoDB and Web Server
+Description: >
+  UrbanGrow Group Project.
+  Insecure demo environment with Web Server, MongoDB on EC2,
+  and optional Windows VDI instance.
 
 Parameters:
   GroupName:
@@ -14,6 +17,9 @@ Parameters:
 Conditions:
   CreateVDI: !Equals [!Ref GroupSize, 3]
 
+# ------------------------------------------------------------
+# Networking
+# ------------------------------------------------------------
 Resources:
 
   VPC:
@@ -22,17 +28,20 @@ Resources:
       CidrBlock: 10.0.0.0/16
       EnableDnsSupport: true
       EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub urbangrow-vpc-${GroupName}
 
-  IGW:
+  InternetGateway:
     Type: AWS::EC2::InternetGateway
 
-  IGWAttach:
+  AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
       VpcId: !Ref VPC
-      InternetGatewayId: !Ref IGW
+      InternetGatewayId: !Ref InternetGateway
 
-  PublicSubnet:
+  PublicSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
@@ -40,29 +49,47 @@ Resources:
       MapPublicIpOnLaunch: true
       AvailabilityZone: !Select [0, !GetAZs '']
 
-  RouteTable:
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
 
-  DefaultRoute:
+  PublicRoute:
     Type: AWS::EC2::Route
-    DependsOn: IGWAttach
+    DependsOn: AttachGateway
     Properties:
-      RouteTableId: !Ref RouteTable
+      RouteTableId: !Ref PublicRouteTable
       DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref IGW
+      GatewayId: !Ref InternetGateway
 
-  SubnetRTAssoc:
+  PublicSubnet1Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnet
-      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
 
-  MongoSG:
+  PublicSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+# ------------------------------------------------------------
+# MongoDB EC2
+# ------------------------------------------------------------
+
+  MongoSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: MongoDB Open SG
+      GroupDescription: Allow MongoDB
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -74,14 +101,16 @@ Resources:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: t3.small
-      SubnetId: !Ref PublicSubnet
+      ImageId: ami-00ca32bbc84273381
+      SubnetId: !Ref PublicSubnet1
       KeyName: !Ref KeyName
-      SecurityGroupIds: [!Ref MongoSG]
-      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      SecurityGroupIds:
+        - !Ref MongoSecurityGroup
       UserData:
         Fn::Base64: |
           #!/bin/bash
-          set -xe
+          set -e
+
           cat <<EOF > /etc/yum.repos.d/mongodb-org-7.0.repo
           [mongodb-org-7.0]
           name=MongoDB Repository
@@ -94,12 +123,20 @@ Resources:
           dnf install -y mongodb-org
           sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf
           systemctl enable mongod
-          systemctl restart mongod
+          systemctl start mongod
 
-  WebSG:
+      Tags:
+        - Key: Name
+          Value: !Sub mongo-${GroupName}
+
+# ------------------------------------------------------------
+# Web Server EC2
+# ------------------------------------------------------------
+
+  WebSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Web Open SG
+      GroupDescription: Allow HTTP
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -109,20 +146,66 @@ Resources:
 
   WebInstance:
     Type: AWS::EC2::Instance
+    DependsOn: MongoInstance
     Properties:
       InstanceType: t2.micro
-      SubnetId: !Ref PublicSubnet
+      ImageId: ami-00ca32bbc84273381
+      SubnetId: !Ref PublicSubnet1
       KeyName: !Ref KeyName
-      SecurityGroupIds: [!Ref WebSG]
-      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
       UserData:
-        Fn::Base64: |
+        Fn::Base64: !Sub |
           #!/bin/bash
-          dnf install -y httpd php php-mongodb
-          systemctl enable httpd
+          dnf install -y httpd php php-cli
           systemctl start httpd
+          systemctl enable httpd
 
+          cat <<EOF > /var/www/html/index.php
+          <?php
+          echo "MongoDB Server: ${MongoInstance.PublicIp}";
+          ?>
+          EOF
+
+      Tags:
+        - Key: Name
+          Value: !Sub web-${GroupName}
+
+# ------------------------------------------------------------
+# Optional VDI (Student 3)
+# ------------------------------------------------------------
+
+  VDISecurityGroup:
+    Condition: CreateVDI
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow RDP
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: 0.0.0.0/0
+
+  VDIInstance:
+    Condition: CreateVDI
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: ami-0efee5160a1079475
+      SubnetId: !Ref PublicSubnet1
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref VDISecurityGroup
+
+# ------------------------------------------------------------
+# Outputs
+# ------------------------------------------------------------
 Outputs:
-  MongoServerPublicIP:
-    Value: !GetAtt MongoInstance.PublicIp
+  WebPublicIP:
+    Value: !GetAtt WebInstance.PublicIp
 
+  MongoPublicIP:
+    Value: !GetAtt MongoInstance.PublicIp
+    Export:
+      Name: MongoServerPublicIP
