@@ -1,50 +1,31 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: >
-  CloudFormation stack for the 503AZ UrbanGrow Group Project.
-  Creates a scalable and deliberately insecure environment with
-  a self-hosted MongoDB on EC2.
+Description: UrbanGrow insecure lab environment with MongoDB, Web Server, and optional VDI
 
 Parameters:
   GroupName:
     Type: String
-    Description: The unique group name or number to tag resources (e.g., Group-01)
-
   GroupSize:
     Type: Number
-    Description: Number of students in the group
     Default: 2
     AllowedValues: [2, 3]
-
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
-    Description: Existing EC2 KeyPair for SSH / RDP access
 
 Conditions:
   CreateVDI: !Equals [!Ref GroupSize, 3]
 
 Resources:
 
-  # ------------------------------------------------------------#
-  # Networking
-  # ------------------------------------------------------------#
+  # -------------------- Networking -------------------- #
   VPC:
     Type: AWS::EC2::VPC
     Properties:
       CidrBlock: 10.0.0.0/16
       EnableDnsSupport: true
       EnableDnsHostnames: true
-      Tags:
-        - Key: Name
-          Value: !Sub urbangrow-vpc-${GroupName}
-        - Key: GroupName
-          Value: !Ref GroupName
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
-    Properties:
-      Tags:
-        - Key: GroupName
-          Value: !Ref GroupName
 
   AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -52,74 +33,38 @@ Resources:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
 
-  PublicSubnet1:
+  PublicSubnet:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.0.1.0/24
       AvailabilityZone: !Select [0, !GetAZs '']
       MapPublicIpOnLaunch: true
-      Tags:
-        - Key: Name
-          Value: !Sub urbangrow-public-subnet-1-${GroupName}
 
-  PublicSubnet2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.2.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
-      MapPublicIpOnLaunch: true
-      Tags:
-        - Key: Name
-          Value: !Sub urbangrow-public-subnet-2-${GroupName}
-
-  PrivateSubnet1:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.10.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-
-  PrivateSubnet2:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref VPC
-      CidrBlock: 10.0.11.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
-
-  PublicRouteTable:
+  RouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
 
-  DefaultPublicRoute:
+  DefaultRoute:
     Type: AWS::EC2::Route
     DependsOn: AttachGateway
     Properties:
-      RouteTableId: !Ref PublicRouteTable
+      RouteTableId: !Ref RouteTable
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
 
-  PublicSubnet1RouteTableAssociation:
+  SubnetRouteAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnet1
-      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
 
-  PublicSubnet2RouteTableAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref PublicSubnet2
-      RouteTableId: !Ref PublicRouteTable
-
-  # ------------------------------------------------------------#
-  # MongoDB EC2
-  # ------------------------------------------------------------#
-  MongoSecurityGroup:
+  # -------------------- MongoDB -------------------- #
+  MongoSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Insecure MongoDB access
+      GroupDescription: Insecure MongoDB SG
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -127,29 +72,40 @@ Resources:
           ToPort: 27017
           CidrIp: 0.0.0.0/0
 
-  MongoEC2Instance:
+  MongoInstance:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: t3.small
-      SubnetId: !Ref PublicSubnet1
+      SubnetId: !Ref PublicSubnet
       KeyName: !Ref KeyName
-      SecurityGroupIds: [!Ref MongoSecurityGroup]
+      SecurityGroupIds: [!Ref MongoSG]
       ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
       UserData:
         Fn::Base64: |
           #!/bin/bash
+          set -xe
+
+          cat <<EOF > /etc/yum.repos.d/mongodb-org-7.0.repo
+          [mongodb-org-7.0]
+          name=MongoDB Repository
+          baseurl=https://repo.mongodb.org/yum/amazon/2023/mongodb-org/7.0/x86_64/
+          gpgcheck=1
+          enabled=1
+          gpgkey=https://www.mongodb.org/static/pgp/server-7.0.asc
+          EOF
+
           dnf install -y mongodb-org
           sed -i 's/bindIp: 127.0.0.1/bindIp: 0.0.0.0/' /etc/mongod.conf
           systemctl enable mongod
-          systemctl start mongod
+          systemctl restart mongod
 
-  # ------------------------------------------------------------#
-  # Web Server EC2
-  # ------------------------------------------------------------#
-  WebServerSecurityGroup:
+          until ss -lnt | grep 27017; do sleep 5; done
+
+  # -------------------- Web Server -------------------- #
+  WebSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Insecure HTTP access
+      GroupDescription: Insecure Web SG
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -157,13 +113,13 @@ Resources:
           ToPort: 80
           CidrIp: 0.0.0.0/0
 
-  WebServerInstance:
+  WebInstance:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: t2.micro
-      SubnetId: !Ref PublicSubnet1
+      SubnetId: !Ref PublicSubnet
       KeyName: !Ref KeyName
-      SecurityGroupIds: [!Ref WebServerSecurityGroup]
+      SecurityGroupIds: [!Ref WebSG]
       ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
       UserData:
         Fn::Base64: |
@@ -172,10 +128,8 @@ Resources:
           systemctl enable httpd
           systemctl start httpd
 
-  # ------------------------------------------------------------#
-  # VDI (Conditional)
-  # ------------------------------------------------------------#
-  VDISecurityGroup:
+  # -------------------- VDI (Optional) -------------------- #
+  VDISG:
     Type: AWS::EC2::SecurityGroup
     Condition: CreateVDI
     Properties:
@@ -192,18 +146,13 @@ Resources:
     Condition: CreateVDI
     Properties:
       InstanceType: t3.medium
-      SubnetId: !Ref PublicSubnet1
+      SubnetId: !Ref PublicSubnet
       KeyName: !Ref KeyName
-      SecurityGroupIds: [!Ref VDISecurityGroup]
+      SecurityGroupIds: [!Ref VDISG]
       ImageId: !Sub "{{resolve:ssm:/aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base}}"
 
 Outputs:
-  WebServerPublicIP:
-    Value: !GetAtt WebServerInstance.PublicIp
-
   MongoServerPublicIP:
-    Value: !GetAtt MongoEC2Instance.PublicIp
-
-  VDIInstanceId:
-    Condition: CreateVDI
-    Value: !Ref VDIInstance
+    Value: !GetAtt MongoInstance.PublicIp
+  WebServerPublicIP:
+    Value: !GetAtt WebInstance.PublicIp
